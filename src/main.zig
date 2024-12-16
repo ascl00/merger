@@ -115,3 +115,23 @@ pub fn main() !void {
         }
     }
 }
+
+const expect = std.testing.expect;
+test "Successful file opening and line counting" {
+    // Test case 1: Successful file opening and line counting
+
+    // const temp_file_path = try std.fs.cwd().openFile("temp_file.txt", .{});
+    const temp_file_path = "temp_file.txt";
+    var handle = try std.fs.cwd().createFile(temp_file_path, .{});
+    defer std.fs.cwd().deleteFile(temp_file_path) catch {};
+    defer handle.close();
+    try handle.writeAll("Line 1\nLine 2\nLine 3");
+
+    // Initialize SourceFile with the temporary file path
+
+    const source_file = try SourceFile.init(temp_file_path);
+
+    // Assertions
+    try expect(std.mem.eql(u8, source_file.name, temp_file_path)); // Verify filename
+    try expect(source_file.total_lines == 3); // Verify line count
+}

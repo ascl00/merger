@@ -10,5 +10,14 @@
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "zig build"
         },
+        {
+            "name": "Debug Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/zig-out/bin/${fileBasenameNoExtension}-test",
+            "preLaunchTask": "build-test",
+            "MIMode": "lldb",
+            "cwd": "${workspaceFolder}"
+        }
     ]
 }
