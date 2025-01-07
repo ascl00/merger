@@ -1,0 +1,1 @@
+Simple tool to merge multiple (2+) files in an equal weighted way. So 3 files of vastly differently lengths will be merged in a way that the files are distributed evenly throughout the output while retaining the same order.
