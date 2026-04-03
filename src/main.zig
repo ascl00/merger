@@ -103,11 +103,6 @@ pub const SourceFile = struct {
             return std.mem.trimRight(u8, line, "\r");
         }
     }
-
-    fn getNextLine(self: *SourceFile, buffer: []u8) !?[]const u8 {
-        _ = buffer; // Not used with modern API - we use internal buffers
-        return self.readNextLine();
-    }
 };
 
 pub fn mergeFiles(source_files: *std.array_list.Managed(SourceFile), writer: anytype) !void {
@@ -135,7 +130,7 @@ pub fn mergeFiles(source_files: *std.array_list.Managed(SourceFile), writer: any
         }
         
         if (candidate) |f| {
-            if (try f.getNextLine(&f.reader_buffer)) |line| {
+            if (try f.readNextLine()) |line| {
                 try writer.print("{s}\n", .{line});
                 f.current_line += 1;
             }
