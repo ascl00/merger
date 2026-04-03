@@ -34,9 +34,9 @@ pub const SourceFile = struct {
         // Initialize the reader for counting
         self.file_reader = self.handle.reader(&self.reader_buffer);
         
-        // Count lines using modern API
-        while (try self.readNextLine()) |line| {
-            _ = line;
+        // Count lines using modern API (pass null buffer to skip collecting)
+        var count_buffer: [4096]u8 = undefined;
+        while (try self.readNextLine(&count_buffer)) |_| {
             line_count += 1;
         }
         
@@ -48,13 +48,12 @@ pub const SourceFile = struct {
         return self;
     }
 
-    fn readNextLine(self: *SourceFile) !?[]const u8 {
+    fn readNextLine(self: *SourceFile, buffer: []u8) !?[]const u8 {
         while (true) {
             var file_reader = self.file_reader orelse return error.ReaderNotInitialized;
             
-            // Create a fixed buffer to collect the line
-            var line_buffer: [4096]u8 = undefined;
-            var line_writer = std.Io.Writer.fixed(&line_buffer);
+            // Use provided buffer
+            var line_writer = std.Io.Writer.fixed(buffer);
             
             // Stream until newline delimiter
             const bytes_read = file_reader.interface.streamDelimiter(&line_writer, '\n') catch |err| {
@@ -112,6 +111,9 @@ pub fn mergeFiles(source_files: *std.array_list.Managed(SourceFile), writer: any
         std.log.debug("file {s} has a total_lines of {d}", .{ file.name, file.total_lines });
     }
     
+    // Reusable buffer for reading lines
+    var line_buffer: [4096]u8 = undefined;
+    
     var i: u32 = 0;
     while (i < total_lines) : (i += 1) {
         var weight: f64 = 1.1;
@@ -130,7 +132,7 @@ pub fn mergeFiles(source_files: *std.array_list.Managed(SourceFile), writer: any
         }
         
         if (candidate) |f| {
-            if (try f.readNextLine()) |line| {
+            if (try f.readNextLine(&line_buffer)) |line| {
                 try writer.print("{s}\n", .{line});
                 f.current_line += 1;
             }
