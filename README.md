@@ -67,4 +67,4 @@ This ensures that each file contributes lines proportional to its size in the fi
 
 ## License
 
-See repository for license information.
+MIT licensed — see the [LICENSE](LICENSE) file.

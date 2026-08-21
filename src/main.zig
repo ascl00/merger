@@ -1,14 +1,18 @@
-pub const std_options = std.Options{
-    .log_level = .info,
-};
-
 const std = @import("std");
 
 const Io = std.Io;
 const File = std.Io.File;
 const Dir = std.Io.Dir;
 
+pub const std_options = std.Options{
+    .log_level = .info,
+};
+
 /// A file to merge.
+///
+/// `name` borrows the caller's path slice; the caller must keep it valid
+/// for the lifetime of this value (the CLI keeps argv alive for the
+/// process).
 ///
 /// Invariant: once `readNextLine` has been called on an instance, the value
 /// must never move again (e.g. do not append it to an owning ArrayList
@@ -25,6 +29,13 @@ pub const SourceFile = struct {
 
     fn init(io: Io, path: []const u8) !SourceFile {
         std.log.debug("Attempting to open file {s}", .{path});
+
+        // Reject non-regular files up front. POSIX `open` succeeds on
+        // directories (and the failure would only surface later, as an
+        // opaque read error — or, on some systems, the directory listing
+        // would be merged as data). Symlinks are followed.
+        const st = try Dir.cwd().statFile(io, path, .{});
+        if (st.kind != .file) return error.NotARegularFile;
 
         var handle = try Dir.cwd().openFile(io, path, .{});
         errdefer handle.close(io);
@@ -72,18 +83,13 @@ pub const SourceFile = struct {
     }
 };
 
-const LineResult = struct {
-    /// The line (or trailing partial line) that was read; null at a clean
-    /// end of file.
-    line: ?[]const u8,
-};
-
 /// Attempts to read one line from `reader` into `line_buf`.
 ///
-/// Returns `error.WriteFailed` when the line outgrows the buffer; the
+/// Returns the line (or trailing partial line), or null at a clean end of
+/// file. Returns `error.WriteFailed` when the line outgrows the buffer; the
 /// reader is then left mid-line and the caller must rewind it (seekTo)
 /// before retrying with a larger buffer.
-fn attemptLine(reader: *File.Reader, line_buf: []u8) Io.Reader.StreamError!LineResult {
+fn attemptLine(reader: *File.Reader, line_buf: []u8) Io.Reader.StreamError!?[]const u8 {
     var line_writer = Io.Writer.fixed(line_buf);
     const n = reader.interface.streamDelimiter(&line_writer, '\n') catch |err| switch (err) {
         error.WriteFailed => return err,
@@ -91,14 +97,14 @@ fn attemptLine(reader: *File.Reader, line_buf: []u8) Io.Reader.StreamError!LineR
             // Stream ended without a newline: return the partial line, or
             // null if there was nothing after the last newline.
             const line = line_writer.buffered();
-            return .{ .line = if (line.len == 0) null else stripTrailingCr(line) };
+            return if (line.len == 0) null else stripTrailingCr(line);
         },
         else => |e| return e,
     };
     _ = n;
     // On success the delimiter is the first buffered byte; consume it.
     reader.interface.toss(1);
-    return .{ .line = stripTrailingCr(line_writer.buffered()) };
+    return stripTrailingCr(line_writer.buffered());
 }
 
 /// Strips exactly one trailing '\r' (CRLF line ending), if present. A line
@@ -118,18 +124,17 @@ fn stripTrailingCr(line: []const u8) []const u8 {
 /// the start of the line and retried. The rewind uses `seekTo`, so this
 /// only works with seekable files; non-seekable inputs (pipes, stdin) would
 /// need the line reading restructured to be supported. The grown buffer is
-/// stored back into
-/// `*line_buf` so later lines reuse it. `initial` is the buffer's original
-/// (unallocated, e.g. stack) slice, used to tell heap from stack. The
-/// caller owns the allocation and must free `*line_buf` if it no longer
-/// points at `initial`.
+/// stored back into `*line_buf` so later lines reuse it. `initial` is the
+/// buffer's original (unallocated, e.g. stack) slice, used to tell heap from
+/// stack. The caller owns the allocation and must free `*line_buf` if it no
+/// longer points at `initial`.
 ///
 /// The returned slice points into `*line_buf` and is valid until the next
 /// call to this function with the same `line_buf`.
 fn readLine(allocator: std.mem.Allocator, reader: *File.Reader, line_buf: *[]u8, initial: []const u8) !?[]const u8 {
     while (true) {
         const line_start = File.Reader.logicalPos(reader);
-        const result = attemptLine(reader, line_buf.*) catch |err| {
+        const line = attemptLine(reader, line_buf.*) catch |err| {
             if (err != error.WriteFailed) return err;
             // The line outgrew the buffer: grow it and retry from the
             // start of the line.
@@ -142,10 +147,20 @@ fn readLine(allocator: std.mem.Allocator, reader: *File.Reader, line_buf: *[]u8,
             try reader.seekTo(line_start); // seekable files only (see doc)
             continue;
         };
-        return result.line;
+        return line;
     }
 }
 
+/// Interleaves the lines of `source_files` proportionally to each file's
+/// size and writes them to `writer`.
+///
+/// Candidate selection is an O(files) scan per output line —
+/// O(total_lines × files) overall. Fine for a handful of inputs; a priority
+/// queue would scale better for very large inputs or many files.
+///
+/// Each file's line count comes from a separate earlier pass (SourceFile.
+/// init), so a file that shrinks in between surfaces here as
+/// error.UnexpectedEndOfStream (known TOCTOU limitation).
 pub fn mergeFiles(allocator: std.mem.Allocator, source_files: []SourceFile, writer: *Io.Writer) !void {
     var total_lines: u64 = 0;
     for (source_files) |file| {
@@ -184,6 +199,9 @@ pub fn mergeFiles(allocator: std.mem.Allocator, source_files: []SourceFile, writ
 
         if (candidate) |f| {
             std.log.debug("For line {d} we have a candidate {s} ({d}/{d})", .{ i, f.name, f.current_line, f.total_lines });
+            // A null line this early means the file ended sooner than the
+            // counting pass predicted (it shrank in between): the
+            // documented TOCTOU case.
             const line = (try f.readNextLine(allocator, &line_buf, &line_buffer)) orelse return error.UnexpectedEndOfStream;
             try writer.print("{s}\n", .{line});
             f.current_line += 1;
@@ -213,7 +231,7 @@ pub fn main(init: std.process.Init) !void {
     while (args_iter.next()) |arg| {
         try paths.append(gpa, arg);
     }
-    std.log.debug("argv.len = {d}", .{paths.items.len + 1});
+    std.log.debug("input files: {d}", .{paths.items.len});
     if (paths.items.len == 0) {
         try printUsage(io, argv0);
         return error.Usage;
@@ -242,6 +260,9 @@ pub fn main(init: std.process.Init) !void {
     // growth would move the value and dangle that pointer.
     for (paths.items) |file_path| {
         const file = try SourceFile.init(io, file_path);
+        // If the append below fails (OOM), close the handle here: the defer
+        // at the bottom only closes files that made it into the list.
+        errdefer file.handle.close(io);
         try source_files.append(gpa, file);
         std.log.info("Found {d} lines in {s}", .{ file.total_lines, file_path });
     }
@@ -254,7 +275,10 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn printUsage(io: Io, program: []const u8) !void {
-    var buf: [128]u8 = undefined;
+    // 1024 covers any realistic program path (PATH_MAX is 1024 on POSIX);
+    // a longer argv0 would make print fail with WriteFailed instead of
+    // Usage.
+    var buf: [1024]u8 = undefined;
     var w = File.stderr().writer(io, &buf);
     try w.interface.print("Usage: {s} <file1> [file2] ...\n", .{program});
     try w.interface.flush();
@@ -503,7 +527,7 @@ test "line reading: single line without newline" {
     defer sf.handle.close(std.testing.io);
 
     try expect(sf.total_lines == 1);
-    try expectLines(&sf, &[_][]const u8{ "a" });
+    try expectLines(&sf, &[_][]const u8{"a"});
 }
 
 test "line reading: CRLF line endings are stripped" {
@@ -554,6 +578,13 @@ test "SourceFile.init: missing file returns FileNotFound" {
     var buf: [Dir.max_path_bytes + 64]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "{s}/no_such_file.txt", .{td.base_path}) catch unreachable;
     try std.testing.expectError(error.FileNotFound, SourceFile.init(std.testing.io, path));
+}
+
+test "SourceFile.init: directory input is rejected before any read" {
+    const allocator = std.testing.allocator;
+    var td = try TestDir.init(allocator);
+    defer td.cleanup(allocator);
+    try std.testing.expectError(error.NotARegularFile, SourceFile.init(std.testing.io, td.base_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -719,7 +750,7 @@ test "merge: CRLF inputs produce LF-only output" {
 
     try expect(countLines(output) == 3);
     try expectSubsequence(output, &[_][]const u8{ "a", "b" });
-    try expectSubsequence(output, &[_][]const u8{ "c" });
+    try expectSubsequence(output, &[_][]const u8{"c"});
     try expect(std.mem.indexOfScalar(u8, output, '\r') == null);
 }
 
@@ -759,6 +790,37 @@ test "merge: line longer than the initial 4096-byte line buffer is preserved" {
     try expect(std.mem.indexOf(u8, output, "y") != null);
 }
 
+test "merge: writer failure frees the grown line buffer (no leak)" {
+    // The long line forces the line buffer to grow past 4096 bytes (heap),
+    // then the writer fails before the merge completes. The testing
+    // allocator must report no leak: the grown buffer has to be freed on
+    // the error path (the errdefer in mergeFiles), not only on success.
+    const allocator = std.testing.allocator;
+    var td = try TestDir.init(allocator);
+    defer td.cleanup(allocator);
+    var content: [5001]u8 = undefined;
+    for (content[0..5000]) |*c| {
+        c.* = 'x';
+    }
+    content[5000] = '\n';
+    const path = try td.writeFile(allocator, "long_fail.txt", &content);
+    defer allocator.free(path);
+    var files = std.ArrayList(SourceFile).empty;
+    defer {
+        for (files.items) |f| {
+            f.handle.close(std.testing.io);
+        }
+        files.deinit(allocator);
+    }
+    try files.append(allocator, try SourceFile.init(std.testing.io, path));
+
+    // A 4096-byte output buffer is too small for the 5001-byte line, so
+    // writer.print fails partway through the merge.
+    var out_buf: [4096]u8 = undefined;
+    var w = Io.Writer.fixed(&out_buf);
+    try std.testing.expectError(error.WriteFailed, mergeFiles(allocator, files.items, &w));
+}
+
 // ---------------------------------------------------------------------------
 // mergeFiles: proportional distribution
 // ---------------------------------------------------------------------------
@@ -769,7 +831,7 @@ test "merge: README example — 90-line and 10-line files interleave proportiona
     var a_content: [32]u8 = undefined;
     var pos: usize = 0;
     for (0..10) |i| {
-        const line = std.fmt.bufPrint(a_content[pos..], "A{d}\n", .{ i }) catch unreachable;
+        const line = std.fmt.bufPrint(a_content[pos..], "A{d}\n", .{i}) catch unreachable;
         pos += line.len;
     }
     var td = try TestDir.init(allocator);
@@ -780,7 +842,7 @@ test "merge: README example — 90-line and 10-line files interleave proportiona
     var b_content: [368]u8 = undefined;
     pos = 0;
     for (0..90) |i| {
-        const line = std.fmt.bufPrint(b_content[pos..], "B{d}\n", .{ i }) catch unreachable;
+        const line = std.fmt.bufPrint(b_content[pos..], "B{d}\n", .{i}) catch unreachable;
         pos += line.len;
     }
     const path_b = try td.writeFile(allocator, "ratio_b.txt", b_content[0..pos]);
@@ -846,7 +908,7 @@ test "merge: extreme size ratio (1 line vs 1000 lines)" {
     var b_content: [5000]u8 = undefined;
     var pos: usize = 0;
     for (0..1000) |i| {
-        const line = std.fmt.bufPrint(b_content[pos..], "B{d}\n", .{ i }) catch unreachable;
+        const line = std.fmt.bufPrint(b_content[pos..], "B{d}\n", .{i}) catch unreachable;
         pos += line.len;
     }
     try expect(pos <= b_content.len);
