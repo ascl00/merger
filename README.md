@@ -10,7 +10,7 @@ The tool uses a weighted round-robin algorithm that selects lines from files bas
 
 ## Requirements
 
-- Zig 0.15 or later
+- Zig 0.16 or later
 
 ## Building
 
