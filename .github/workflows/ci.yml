@@ -14,11 +14,31 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: ziglang/zig-action@master
-        with:
-          version: 0.16.0
+      - name: Install Zig
+        run: |
+          set -euo pipefail
+          version="0.16.0"
+          case "${{ runner.os }}" in
+            Linux) os="linux" ;;
+            macOS) os="macos" ;;
+            *) echo "unsupported runner os: ${{ runner.os }}"; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            x86_64) arch="x86_64" ;;
+            arm64|aarch64) arch="aarch64" ;;
+            *) echo "unsupported arch: $(uname -m)"; exit 1 ;;
+          esac
+          asset="zig-${arch}-${os}-${version}.tar.xz"
+          echo "installing $asset"
+          curl -fsSL "https://ziglang.org/download/${version}/${asset}" -o zig.tar.xz
+          mkdir -p zig
+          tar -xf zig.tar.xz -C zig --strip-components=1
+          echo "$(pwd)/zig" >> "$GITHUB_PATH"
+          export PATH="$(pwd)/zig:$PATH"
+          zig version
       - name: Check formatting
-        run: zig fmt --check
+        # zig fmt requires explicit paths in 0.16 (no bare-cwd default).
+        run: zig fmt --check src/main.zig build.zig
       - name: Build
         run: zig build
       - name: Run tests
